@@ -1,0 +1,7 @@
+streamlit
+transformers
+sentence-transformers
+torch
+openai
+pytesseract
+pdf2image
