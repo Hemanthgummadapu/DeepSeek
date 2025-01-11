@@ -1,7 +1,7 @@
 streamlit
 transformers==4.48.0
 sentence-transformers
-torch
+torch==2.4.0
 openai
 pytesseract
 pdf2image
