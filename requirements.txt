@@ -1,0 +1,6 @@
+transformers==4.48.0
+torch==2.4.0
+sentence-transformers==3.3.1
+openai
+pytesseract
+pdf2image
