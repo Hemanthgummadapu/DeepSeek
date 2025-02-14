@@ -18,7 +18,7 @@ def log(message):
 
 # Load DeepSeek model
 log("🚀 Loading DeepSeek model...")
-MODEL_NAME = "deepseek-ai/deepseek-coder-6.7b-instruct"
+MODEL_NAME = "deepseek-ai/deepseek-coder-1.3b-instruct"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
