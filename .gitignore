@@ -1,0 +1,18 @@
+# Node.js & React
+node_modules/
+package-lock.json
+yarn.lock
+build/
+dist/
+
+# Python & Virtual Environment
+__pycache__/
+venv/
+
+# Logs & Cache
+*.log
+.DS_Store
+
+# Environment Variables
+.env
+

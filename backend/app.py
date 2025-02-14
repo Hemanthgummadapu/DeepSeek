@@ -1,187 +1,143 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from pydantic import BaseModel
 import pytesseract
 from pdf2image import convert_from_path
 import tempfile
-from transformers import T5Tokenizer, T5ForConditionalGeneration
-import openai
-import json
-from sentence_transformers import SentenceTransformer, util
+import subprocess
+import os
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from datetime import datetime
 
-# Set OpenAI API key (hardcoded)
-openai.api_key = "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"
+# Initialize FastAPI app
+app = FastAPI()
 
-# Initialize Flask app
-app = Flask(__name__)
-
-# Allow CORS from frontend
-CORS(app, resources={r"/*": {"origins": "http://localhost:3001"}})
-
-# Load models
-print("Loading tokenizer and T5 model...")
-tokenizer = T5Tokenizer.from_pretrained("doc2query/msmarco-t5-base-v1")
-t5_model = T5ForConditionalGeneration.from_pretrained("doc2query/msmarco-t5-base-v1")
-print("Models loaded successfully!")
-
-# Initialize sentence similarity model
-similarity_model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda" if torch.cuda.is_available() else "cpu")
-
+# Logging utility
 def log(message):
-    """Utility function to log messages with a timestamp."""
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}")
 
-def build_question_schema(question, context):
-    """Generate a schema for a question using GPT-4."""
-    prompt = (
-        f"Context: {context}\n"
-        f"Question: {question}\n"
-        "Generate the following JSON format:\n"
-        "{\n"
-        "  \"correct_answer\": \"[Correct Answer]\",\n"
-        "  \"wrong_answers\": [\"Wrong Option 1\", \"Wrong Option 2\", \"Wrong Option 3\"],\n"
-        "  \"hints\": [\"Hint 1\", \"Hint 2\"],\n"
-        "  \"explanation\": \"[Provide a clear and concise explanation of the answer.]\"\n"
-        "}"
-    )
+# Load DeepSeek model
+log("🚀 Loading DeepSeek model...")
+MODEL_NAME = "deepseek-ai/deepseek-coder-6.7b-instruct"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    device_map="auto" if device == "cuda" else None
+)
+
+log(f"✅ DeepSeek model loaded successfully on {device.upper()}")
+
+# PDF text extraction function
+def extract_text_from_pdf(pdf_path):
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are an educational assistant that provides JSON-formatted answers."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        content = response["choices"][0]["message"]["content"]
+        log(f"🔍 Running pdftotext on {pdf_path}")
+        result = subprocess.run(["pdftotext", pdf_path, "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            log("✅ Extracted text using pdftotext.")
+            return result.stdout.strip()
 
-        # Parse the JSON response from GPT-4
-        try:
-            schema = json.loads(content)
-            return schema
-        except json.JSONDecodeError:
-            print(f"Error decoding JSON: {content}")
-            return {"error": "Invalid JSON response from GPT-4."}
+        # If pdftotext fails, use OCR
+        log(f"⚠️ pdftotext failed: {result.stderr.strip()}")
+        log("⚠️ Falling back to OCR (Tesseract)...")
+
+        images = convert_from_path(pdf_path)
+        extracted_text_list = [pytesseract.image_to_string(img) for img in images]
+        return " ".join(extracted_text_list).strip() if extracted_text_list else "❌ No valid text extracted."
+
     except Exception as e:
-        print(f"Error generating schema: {e}")
-        return {"error": str(e)}
+        log(f"❌ Error extracting text: {e}")
+        return "❌ Error extracting text."
 
-def generate_questions(context, num_questions=5, similarity_threshold=0.8):
+# Define request structure for question generation
+class GenerateRequest(BaseModel):
+    context: str
+    num_questions: int = 5
+
+# AI question generation function
+def generate_questions_finetuned(context, num_questions=5):
+    prompt = f"""
+    Generate exactly {num_questions} multiple-choice questions based on the given context.
+    Each question should have four answer choices.
+
+    - The correct answer must be explicitly labeled using **CorrectAnswer:** before stating the correct option.
+    - Provide a **Hint** that guides the user without directly indicating the correct choice.
+    - Include an **Explanation** that justifies why the correct answer is correct.
+
+    Context:
+    {context}
+
+    Output Format:
+    1. Question?
+       a) Option 1
+       b) Option 2
+       c) Option 3
+       d) Option 4
+       **CorrectAnswer:** "X"
+       **Hint:** Consider relevant concepts or historical facts related to the question.
+       **Explanation:** "X" is correct because [detailed reason].
+
+    Questions:
     """
-    Generates a specified number of unique, high-confidence questions based on input context,
-    ensuring semantic deduplication.
-    """
-    input_text = (
-        f"Generate specific, high-confidence questions grounded in the following context: {context}. "
-        "Ensure the questions are highly relevant, unambiguous, and cover key details."
-    )
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        output = model.generate(**inputs, max_new_tokens=1024, temperature=0.7)
+        return tokenizer.decode(output[0], skip_special_tokens=True)
+    except Exception as e:
+        log(f"❌ Error generating questions: {e}")
+        return "❌ Error generating questions."
 
-    num_beams = max(num_questions * 2, 10)  # Ensure sufficient beams for quality
-    num_return_sequences = min(num_beams, 20)  # Generate more sequences for better deduplication
+# API Endpoints
 
-    # Generate questions with T5 model
-    inputs = tokenizer(
-        input_text, return_tensors="pt", max_length=512, truncation=True
-    ).to(t5_model.device)
-    output_sequences = t5_model.generate(
-        **inputs,
-        max_length=50,
-        num_return_sequences=num_return_sequences,
-        num_beams=num_beams,
-        output_scores=True,
-        return_dict_in_generate=True,
-        early_stopping=True
-    )
-
-    # Extract generated questions and their confidence scores
-    questions_with_scores = [
-        (tokenizer.decode(seq, skip_special_tokens=True), torch.exp(score).item() * 100)
-        for seq, score in zip(output_sequences.sequences, output_sequences.sequences_scores)
-    ]
-
-    # Deduplicate questions using semantic similarity
-    questions = [q for q, _ in questions_with_scores]
-    confidences = [c for _, c in questions_with_scores]
-    embeddings = similarity_model.encode(questions, convert_to_tensor=True)
-
-    final_questions = []
-    seen_questions = set()
-
-    for idx, (question, confidence) in enumerate(zip(questions, confidences)):
-        # Check similarity with previously selected questions
-        if any(util.cos_sim(embeddings[idx], embeddings[j]).item() >= similarity_threshold for j in range(len(final_questions))):
-            continue  # Skip duplicate questions
-        final_questions.append(question)
-        seen_questions.add(question)
-        if len(final_questions) >= num_questions:
-            break
-
-    return final_questions
-
-@app.route("/", methods=["GET"])
+@app.get("/")
 def home():
     """Root route to confirm server is running."""
-    return jsonify({"message": "Trivia Generator Backend is Running!"}), 200
+    return {"message": "DeepSeek Backend is Running!"}
 
-@app.route("/process-pdf", methods=["POST"])
-def process_pdf():
-    """Endpoint to process PDF and generate questions."""
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+@app.post("/process-pdf/")
+async def process_pdf(file: UploadFile = File(...)):
+    """Extracts text from uploaded PDF file."""
+    log(f"✅ Received file: {file.filename}")
 
-    file = request.files['file']
-
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     try:
-        # Extract text from PDF
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(file.read())
-            images = convert_from_path(tmp_file.name)
-            context = "".join(pytesseract.image_to_string(img) for img in images)
+        tmp_file.write(file.file.read())
+        tmp_file_path = tmp_file.name
+        tmp_file.close()
 
-        if not context.strip():
-            return jsonify({"error": "No text extracted from the PDF."}), 400
+        log(f"✅ Saved uploaded file as: {tmp_file_path}")
 
-        # Return text extraction result to frontend
-        extracted_response = {
-            "status": "text_extracted",
-            "message": "Text extracted from PDF successfully!",
-            "context": context
-        }
+        extracted_text = extract_text_from_pdf(tmp_file_path)
+        os.remove(tmp_file_path)  # Cleanup
 
-        # Send the extracted context back to the frontend
-        return jsonify(extracted_response)
+        if not extracted_text.strip():
+            raise HTTPException(status_code=400, detail="No text extracted from the PDF.")
+
+        return {"status": "text_extracted", "message": "Text extracted successfully!", "context": extracted_text}
 
     except Exception as e:
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+        log(f"❌ Error processing PDF: {e}")
+        os.remove(tmp_file.name)  # Cleanup
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.route("/generate-questions", methods=["POST"])
-def generate_questions_endpoint():
-    """Endpoint to generate questions based on the extracted text."""
-    data = request.json
-    context = data.get('context', '')
+@app.post("/generate-questions/")
+def generate_questions_endpoint(request: GenerateRequest):
+    """Generates AI-based multiple-choice questions."""
+    if not request.context.strip():
+        raise HTTPException(status_code=400, detail="Context is required to generate questions.")
 
-    if not context:
-        return jsonify({"error": "Context is required to generate questions."}), 400
-
-    # Generate unique and high-confidence questions
     try:
-        questions = generate_questions(context, num_questions=5)
-
-        # Generate schemas for each unique question
-        schemas = []
-        for question in questions:
-            schema = build_question_schema(question, context)
-            schemas.append({"question": question, "schema": schema})
-
-        return jsonify({
-            "status": "questions_generated",
-            "message": "Questions generated successfully!",
-            "questions": schemas
-        })
+        questions = generate_questions_finetuned(request.context[:1500], num_questions=request.num_questions)
+        return {"status": "questions_generated", "message": "Questions generated successfully!", "questions": questions}
 
     except Exception as e:
-        return jsonify({"error": f"An error occurred while generating questions: {str(e)}"}), 500
+        raise HTTPException(status_code=500, detail=f"An error occurred while generating questions: {str(e)}")
 
+# Start the server
 if __name__ == "__main__":
-    # Run the Flask app
-    app.run(debug=True)
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
